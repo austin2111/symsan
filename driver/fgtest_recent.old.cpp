@@ -43,55 +43,6 @@ dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
 }
 
-// Function for filtering irrelevant PC values (interrupt handlers, copy routines)
-
-static bool should_filter_by_pc(u64 pc) {
-    // irqentry_exit
-    if (pc >= 0xffffffff84425420 && pc <= 0xffffffff84425466)
-        return true;
-    
-    // copy_user_generic_unrolled
-    if (pc >= 0xffffffff8245fdb0 && pc <= 0xffffffff8245fe61)
-        return true;
-    
-    // copy_user_enhanced_fast_string
-    if (pc >= 0xffffffff8245feb0 && pc <= 0xffffffff8245fec5)
-        return true;
-    
-    // kmalloc_slab internals
-    if (pc >= 0xffffffff8188d160 && pc <= 0xffffffff8188d1f9)
-        return true;
-
-    // error_entry
-    if (pc >= 0xffffffff84600ee0 && pc <= 0xffffffff84600f9c)
-        return true;
-
-    // check_memory_region/memory_is_nonzero
-    // WARNING: This shoulld probably be commented out!
-    if (pc >= 0xffffffff81964130 && pc <= 0xffffffff819642e4)
-        return true;
-
-    // irqentry_enter
-    if (pc >= 0xffffffff844253c0 && pc <= 0xffffffff844253f8)
-        return true;
-
-    // native_iret
-    if (pc >= 0xffffffff84600d30 && pc <= 0xffffffff84600dec)
-        return true;
-
-    // Another IRQ function
-    if (pc >= 0xffffffff81501840 && pc <= 0xffffffff815086f4)
-        return true;
-
-    // tick_sched_handle
-    if (pc >= 0xffffffff8155bbe0 && pc <= 0xffffffff8155bd57)
-        return true;
-
-    // sysvec_apic_timer_interrupt
-    if (pc >= 0xffffffff84424560 && pc <= 0xffffffff8442461b)
-
-    return false;
-}
 
 // Helper function for selective constraint dropping
 
@@ -417,7 +368,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     } else {
       throw z3::exception("invalid Ite operation(for bool expr only)");
     }
-  
+  /*
   } else if (info->op == Equal) {
     // try an alternative symbolic address.
     // build an equal expression for a symbolic address.
@@ -426,8 +377,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, e, deps);
   }
-  
-  /*
+  */
   } else if (info->op == Equal) {
       z3::expr lhs = serialize(info->l1, deps);
       z3::expr rhs = __z3_context.bv_val((uint64_t)info->op1.i, info->size);
@@ -448,7 +398,6 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
       tsize_cache[label] = tsize_cache[info->l1];
       return cache_expr(label, e, deps);
   }
-  */
 
   // common ops
   u8 size = info->size;
@@ -463,23 +412,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
 
   z3::expr op1 = __z3_context.bv_val((uint64_t)info->op1.i, size);
   if (info->l1 >= CONST_OFFSET) {
-    //op1 = serialize(info->l1, deps).simplify();
-    z3::expr raw = serialize(info->l1, deps);
-    try {
-        op1 = raw.simplify();
-    } catch (z3::exception &e) {
-        // Z3 simplification failed - use raw expression
-        AOUT("WARNING: simplify() failed at label %u (l1): %s\n", label, e.msg());
-        op1 = raw;
-    } catch (std::exception &e) {
-        // Other standard exceptions
-        AOUT("WARNING: simplify() failed at label %u (l1): %s\n", label, e.what());
-        op1 = raw;
-    } catch (...) {
-        // Unknown exception (shouldn't happen, but be safe)
-        AOUT("WARNING: simplify() failed at label %u (l1): unknown exception\n", label);
-        op1 = raw;
-    }
+    op1 = serialize(info->l1, deps).simplify();
   }
 
   if (info->l2 == 0) {
@@ -494,20 +427,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
   if (info->l2 >= CONST_OFFSET) {
     std::unordered_set<u32> deps2;
-    //op2 = serialize(info->l2, deps2).simplify();
-    z3::expr raw = serialize(info->l2, deps2);
-    try {
-        op2 = raw.simplify();
-    } catch (z3::exception &e) {
-        AOUT("WARNING: simplify() failed at label %u (l2): %s\n", label, e.msg());
-        op2 = raw;
-    } catch (std::exception &e) {
-        AOUT("WARNING: simplify() failed at label %u (l2): %s\n", label, e.what());
-        op2 = raw;
-    } catch (...) {
-        AOUT("WARNING: simplify() failed at label %u (l2): unknown exception\n", label);
-        op2 = raw;
-    }
+    op2 = serialize(info->l2, deps2).simplify();
     deps.insert(deps2.begin(),deps2.end());
   }
   // AOUT("op %ld: op1 sort size = %d, op2 sort size = %d\n", info->op, op1.get_sort().bv_size(), op2.get_sort().bv_size());
@@ -707,20 +627,7 @@ static z3::expr serialize_simple(dfsan_label label) {
 
   z3::expr op1 = __z3_context.bv_val((uint64_t)info->op1.i, size);
   if (info->l1 >= CONST_OFFSET) {
-    //op1 = serialize_simple(info->l1).simplify();
-    z3::expr raw = serialize_simple(info->l1);
-    try {
-        op1 = raw.simplify();
-    } catch (z3::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.msg());
-        op1 = raw;
-    } catch (std::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.what());
-        op1 = raw;
-    } catch (...) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): unknown exception\n", label);
-        op1 = raw;
-    }
+    op1 = serialize_simple(info->l1).simplify();
   }
 
   if (info->l2 == 0) {
@@ -735,20 +642,7 @@ static z3::expr serialize_simple(dfsan_label label) {
   z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
   if (info->l2 >= CONST_OFFSET) {
     std::unordered_set<u32> deps2;
-    //op2 = serialize_simple(info->l2).simplify();
-    z3::expr raw = serialize_simple(info->l1);
-    try {
-        op1 = raw.simplify();
-    } catch (z3::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.msg());
-        op1 = raw;
-    } catch (std::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.what());
-        op1 = raw;
-    } catch (...) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): unknown exception\n", label);
-        op1 = raw;
-    }
+    op2 = serialize_simple(info->l2).simplify();
   }
   // AOUT("op %ld: op1 sort size = %d, op2 sort size = %d\n", info->op, op1.get_sort().bv_size(), op2.get_sort().bv_size());
 
@@ -958,7 +852,6 @@ static bool __solve_expr(z3::expr &e) {
   // set up local optmistic solver
   z3::solver opt_solver = z3::solver(__z3_context, "QF_BV");
   opt_solver.set("timeout", 1000U); // follow timeout of symcc
-  //opt_solver.set("unsat_core", true); // For testing; this'll probably slow it down in the long run
   opt_solver.add(e);
   // fprintf(stderr, "\n%s\n", __z3_solver.to_smt2().c_str());
   // return false;
@@ -996,14 +889,6 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
       return;
   }
 
-  // Filter by PC FIRST (before any expensive operations)
-  if (should_filter_by_pc(addr)) {
-      if (print_debug) {
-          AOUT("[FILTERED PC] Skipping noisy function at 0x%llx\n", addr);
-      }
-      return;
-  }
-
   z3::expr result = __z3_context.bool_val(r != 0);
 
   bool pushed = false;
@@ -1011,23 +896,9 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
     std::unordered_set<dfsan_label> inputs;
     z3::expr cond = serialize(label, inputs).simplify();
 
-    // ===== NEW: Filter concrete/trivial branches =====
-    if (cond.is_true() || cond.is_false()) {
-        if (print_debug) {
-            AOUT("[CONCRETE] Branch at PC 0x%llx simplified to: %s\n",
-                 addr, cond.is_true() ? "true" : "false");
-        }
-        return;  // Don't add constraint
-    }
-    // ================================================
-
     //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
     AOUT("sym branch: 0x%llx constraint: %s, add_nested: %d\n", addr, cond.to_string().c_str(), add_nested);
-    if(is_allocator_constraint(cond)) {
-        printf("ALLOCATOR_DEBUG: This looks like an allocator constraint! Returning...\n");
-        return;
-    }
-    //printf("ALLOCATOR_DEBUG: is_allocator_constraint returned %d!\n", is_allocator_constraint(cond));
+    printf("ALLOCATOR_DEBUG: is_allocator_constraint returned %d!\n", is_allocator_constraint(cond));
     // return;
     // collect additional input deps
     std::vector<dfsan_label> worklist;
@@ -1127,46 +998,34 @@ if (print_debug) {
 if (print_debug) {
     AOUT("\n=== CONSTRAINTS (Original) ===\n");
     AOUT("%s\n", __z3_solver.to_smt2().c_str());
-
+    
     z3::check_result checked_result = __z3_solver.check();
-    AOUT("\n=== SOLVER RESULT: %s ===\n",
-         checked_result == z3::sat ? "SAT" :
+    AOUT("\n=== SOLVER RESULT: %s ===\n", 
+         checked_result == z3::sat ? "SAT" : 
          checked_result == z3::unsat ? "UNSAT" : "UNKNOWN");
-
+    
     if (checked_result == z3::sat) {
         z3::model m = __z3_solver.get_model();
-
+        
         AOUT("\n=== SOLUTION (Human-Readable) ===\n");
         // ...
-    for (unsigned i = 0; i < m.size(); i++) {
-      z3::func_decl v = m[i];
-      AOUT("  %s = %s\n",
-           v.name().str().c_str(),
-           m.get_const_interp(v).to_string().c_str());
-    }
-
-    AOUT("\n=== CONSTRAINTS WITH VALUES ===\n");
-    z3::expr_vector assertions = __z3_solver.assertions();
-    for (unsigned i = 0; i < assertions.size(); i++) {
-      z3::expr evaluated = m.eval(assertions[i], true);
-      AOUT("  %s evaluates to %s\n",
-           assertions[i].to_string().c_str(),
-           evaluated.to_string().c_str());
-        }
+        
+        AOUT("\n=== CONSTRAINTS WITH VALUES ===\n");
+        // ...
     } else if (checked_result == z3::unsat) {
         AOUT("\n=== PATH IS UNSATISFIABLE ===\n");
         AOUT("This branch cannot be taken with the accumulated constraints.\n");
-
+        
         // Optionally: print unsat core
-        //if (print_debug > 1) {
+        if (print_debug > 1) {
             z3::expr_vector core = __z3_solver.unsat_core();
             AOUT("\n=== UNSAT CORE (%u constraints) ===\n", core.size());
             for (unsigned i = 0; i < core.size(); i++) {
                 AOUT("[%u] %s\n", i, core[i].to_string().c_str());
             }
-        //}
+        }
     }
-
+    
     AOUT("====================================\n\n");
 }
     // fprintf(stderr, "%s\n", __z3_solver.to_smt2().c_str());

@@ -43,147 +43,6 @@ dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
 }
 
-// Function for filtering irrelevant PC values (interrupt handlers, copy routines)
-
-static bool should_filter_by_pc(u64 pc) {
-    // irqentry_exit
-    if (pc >= 0xffffffff84425420 && pc <= 0xffffffff84425466)
-        return true;
-    
-    // copy_user_generic_unrolled
-    if (pc >= 0xffffffff8245fdb0 && pc <= 0xffffffff8245fe61)
-        return true;
-    
-    // copy_user_enhanced_fast_string
-    if (pc >= 0xffffffff8245feb0 && pc <= 0xffffffff8245fec5)
-        return true;
-    
-    // kmalloc_slab internals
-    if (pc >= 0xffffffff8188d160 && pc <= 0xffffffff8188d1f9)
-        return true;
-
-    // error_entry
-    if (pc >= 0xffffffff84600ee0 && pc <= 0xffffffff84600f9c)
-        return true;
-
-    // check_memory_region/memory_is_nonzero
-    // WARNING: This shoulld probably be commented out!
-    if (pc >= 0xffffffff81964130 && pc <= 0xffffffff819642e4)
-        return true;
-
-    // irqentry_enter
-    if (pc >= 0xffffffff844253c0 && pc <= 0xffffffff844253f8)
-        return true;
-
-    // native_iret
-    if (pc >= 0xffffffff84600d30 && pc <= 0xffffffff84600dec)
-        return true;
-
-    // Another IRQ function
-    if (pc >= 0xffffffff81501840 && pc <= 0xffffffff815086f4)
-        return true;
-
-    // tick_sched_handle
-    if (pc >= 0xffffffff8155bbe0 && pc <= 0xffffffff8155bd57)
-        return true;
-
-    // sysvec_apic_timer_interrupt
-    if (pc >= 0xffffffff84424560 && pc <= 0xffffffff8442461b)
-
-    return false;
-}
-
-// Helper function for selective constraint dropping
-
-#include <z3++.h>
-
-// Helper: Check if a number is a "suspicious" slab size 
-bool is_slab_size(uint64_t val) {
-    if (val == 0) return false;
-    // Power of 2 check (8, 16, 32, 64...)
-    if ((val & (val - 1)) == 0) return true;
-    // Check for common non-power-of-2 slabs (e.g., 96, 192) which are 1.5x a power of 2
-    if ((val % 8) == 0 && val < 4096) return true; 
-    return false;
-}
-
-// The core detector
-bool is_allocator_constraint(z3::expr e) {
-    if (!e.is_app()) return false;
-
-    Z3_decl_kind kind = e.decl().decl_kind();
-
-    // 1. Unwrap Boolean wrappers (NOT, AND)
-    if (kind == Z3_OP_NOT) {
-        return is_allocator_constraint(e.arg(0));
-    }
-    if (kind == Z3_OP_AND || kind == Z3_OP_OR) {
-        for (unsigned i = 0; i < e.num_args(); i++) {
-            if (is_allocator_constraint(e.arg(i))) return true;
-        }
-        return false;
-    }
-
-    // 2. Look for Comparisons
-    bool is_comparison = (kind == Z3_OP_ULEQ || kind == Z3_OP_ULT || 
-                          kind == Z3_OP_UGEQ || kind == Z3_OP_UGT ||
-                          kind == Z3_OP_SLEQ || kind == Z3_OP_SLT ||
-                          kind == Z3_OP_EQ);
-    
-    if (!is_comparison) return false;
-
-    z3::expr lhs = e.arg(0);
-    z3::expr rhs = e.arg(1);
-
-    // 3. Normalize: Ensure Constant is on the RHS
-    if (lhs.is_numeral() && !rhs.is_numeral()) {
-        z3::expr temp = lhs; lhs = rhs; rhs = temp;
-    }
-
-    // 4. Check the RHS (The Limit)
-    uint64_t limit_val = 0;
-    if (rhs.is_numeral()) {
-        // FIX: Call takes no arguments, returns value
-        limit_val = rhs.get_numeral_uint64(); 
-        
-        if (!is_slab_size(limit_val)) {
-            return false; 
-        }
-    } else {
-        return false; 
-    }
-
-    // 5. Check the LHS (The Size Calculation)
-    if (!lhs.is_app()) return false;
-    
-    // Check for Multiplication (size * element_size)
-    if (lhs.decl().decl_kind() == Z3_OP_BMUL) {
-        z3::expr mul_arg1 = lhs.arg(0);
-        z3::expr mul_arg2 = lhs.arg(1);
-        
-        uint64_t mul_const = 0;
-        bool found_mul_const = false;
-
-        // FIX: Check args and get value directly
-        if (mul_arg1.is_numeral()) {
-            mul_const = mul_arg1.get_numeral_uint64();
-            found_mul_const = true;
-        } else if (mul_arg2.is_numeral()) {
-            mul_const = mul_arg2.get_numeral_uint64();
-            found_mul_const = true;
-        }
-
-        if (found_mul_const) {
-            // Heuristic match found: (Variable * Const) compared to SlabSize
-            return true;
-        }
-    }
-
-    return false;
-}
-
-// End selective constraint dropping helper code
-
 // for output
 static const char* __output_dir = ".";
 static u32 __instance_id = 0;
@@ -417,7 +276,6 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     } else {
       throw z3::exception("invalid Ite operation(for bool expr only)");
     }
-  
   } else if (info->op == Equal) {
     // try an alternative symbolic address.
     // build an equal expression for a symbolic address.
@@ -426,29 +284,6 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, e, deps);
   }
-  
-  /*
-  } else if (info->op == Equal) {
-      z3::expr lhs = serialize(info->l1, deps);
-      z3::expr rhs = __z3_context.bv_val((uint64_t)info->op1.i, info->size);
-    
-      if (print_debug) {
-          AOUT("[EQUAL] Comparing %s == %llu (size=%u)\n",
-               lhs.to_string().substr(0, 50).c_str(),
-               (uint64_t)info->op1.i,
-               info->size);
-      }
-    
-      z3::expr e = (lhs == rhs);
-    
-      if (print_debug) {
-          AOUT("[EQUAL] Result: %s\n", e.to_string().c_str());
-      }
-    
-      tsize_cache[label] = tsize_cache[info->l1];
-      return cache_expr(label, e, deps);
-  }
-  */
 
   // common ops
   u8 size = info->size;
@@ -463,23 +298,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
 
   z3::expr op1 = __z3_context.bv_val((uint64_t)info->op1.i, size);
   if (info->l1 >= CONST_OFFSET) {
-    //op1 = serialize(info->l1, deps).simplify();
-    z3::expr raw = serialize(info->l1, deps);
-    try {
-        op1 = raw.simplify();
-    } catch (z3::exception &e) {
-        // Z3 simplification failed - use raw expression
-        AOUT("WARNING: simplify() failed at label %u (l1): %s\n", label, e.msg());
-        op1 = raw;
-    } catch (std::exception &e) {
-        // Other standard exceptions
-        AOUT("WARNING: simplify() failed at label %u (l1): %s\n", label, e.what());
-        op1 = raw;
-    } catch (...) {
-        // Unknown exception (shouldn't happen, but be safe)
-        AOUT("WARNING: simplify() failed at label %u (l1): unknown exception\n", label);
-        op1 = raw;
-    }
+    op1 = serialize(info->l1, deps).simplify();
   }
 
   if (info->l2 == 0) {
@@ -494,20 +313,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
   if (info->l2 >= CONST_OFFSET) {
     std::unordered_set<u32> deps2;
-    //op2 = serialize(info->l2, deps2).simplify();
-    z3::expr raw = serialize(info->l2, deps2);
-    try {
-        op2 = raw.simplify();
-    } catch (z3::exception &e) {
-        AOUT("WARNING: simplify() failed at label %u (l2): %s\n", label, e.msg());
-        op2 = raw;
-    } catch (std::exception &e) {
-        AOUT("WARNING: simplify() failed at label %u (l2): %s\n", label, e.what());
-        op2 = raw;
-    } catch (...) {
-        AOUT("WARNING: simplify() failed at label %u (l2): unknown exception\n", label);
-        op2 = raw;
-    }
+    op2 = serialize(info->l2, deps2).simplify();
     deps.insert(deps2.begin(),deps2.end());
   }
   // AOUT("op %ld: op1 sort size = %d, op2 sort size = %d\n", info->op, op1.get_sort().bv_size(), op2.get_sort().bv_size());
@@ -707,20 +513,7 @@ static z3::expr serialize_simple(dfsan_label label) {
 
   z3::expr op1 = __z3_context.bv_val((uint64_t)info->op1.i, size);
   if (info->l1 >= CONST_OFFSET) {
-    //op1 = serialize_simple(info->l1).simplify();
-    z3::expr raw = serialize_simple(info->l1);
-    try {
-        op1 = raw.simplify();
-    } catch (z3::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.msg());
-        op1 = raw;
-    } catch (std::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.what());
-        op1 = raw;
-    } catch (...) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): unknown exception\n", label);
-        op1 = raw;
-    }
+    op1 = serialize_simple(info->l1).simplify();
   }
 
   if (info->l2 == 0) {
@@ -735,20 +528,7 @@ static z3::expr serialize_simple(dfsan_label label) {
   z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
   if (info->l2 >= CONST_OFFSET) {
     std::unordered_set<u32> deps2;
-    //op2 = serialize_simple(info->l2).simplify();
-    z3::expr raw = serialize_simple(info->l1);
-    try {
-        op1 = raw.simplify();
-    } catch (z3::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.msg());
-        op1 = raw;
-    } catch (std::exception &e) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): %s\n", label, e.what());
-        op1 = raw;
-    } catch (...) {
-        AOUT("WARNING: simplify() failed in serialize_simple at label %u (l1): unknown exception\n", label);
-        op1 = raw;
-    }
+    op2 = serialize_simple(info->l2).simplify();
   }
   // AOUT("op %ld: op1 sort size = %d, op2 sort size = %d\n", info->op, op1.get_sort().bv_size(), op2.get_sort().bv_size());
 
@@ -958,7 +738,6 @@ static bool __solve_expr(z3::expr &e) {
   // set up local optmistic solver
   z3::solver opt_solver = z3::solver(__z3_context, "QF_BV");
   opt_solver.set("timeout", 1000U); // follow timeout of symcc
-  //opt_solver.set("unsat_core", true); // For testing; this'll probably slow it down in the long run
   opt_solver.add(e);
   // fprintf(stderr, "\n%s\n", __z3_solver.to_smt2().c_str());
   // return false;
@@ -989,21 +768,6 @@ static bool __solve_expr(z3::expr &e) {
 
 static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
 
-  // BUGFIX: Don't try to solve for label 0
-
-  if (label == 0) {
-      printf("DEBUG: Label is 0! Let's not solve for this.\n");
-      return;
-  }
-
-  // Filter by PC FIRST (before any expensive operations)
-  if (should_filter_by_pc(addr)) {
-      if (print_debug) {
-          AOUT("[FILTERED PC] Skipping noisy function at 0x%llx\n", addr);
-      }
-      return;
-  }
-
   z3::expr result = __z3_context.bool_val(r != 0);
 
   bool pushed = false;
@@ -1011,23 +775,8 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
     std::unordered_set<dfsan_label> inputs;
     z3::expr cond = serialize(label, inputs).simplify();
 
-    // ===== NEW: Filter concrete/trivial branches =====
-    if (cond.is_true() || cond.is_false()) {
-        if (print_debug) {
-            AOUT("[CONCRETE] Branch at PC 0x%llx simplified to: %s\n",
-                 addr, cond.is_true() ? "true" : "false");
-        }
-        return;  // Don't add constraint
-    }
-    // ================================================
-
-    //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-    AOUT("sym branch: 0x%llx constraint: %s, add_nested: %d\n", addr, cond.to_string().c_str(), add_nested);
-    if(is_allocator_constraint(cond)) {
-        printf("ALLOCATOR_DEBUG: This looks like an allocator constraint! Returning...\n");
-        return;
-    }
-    //printf("ALLOCATOR_DEBUG: is_allocator_constraint returned %d!\n", is_allocator_constraint(cond));
+    // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+    // AOUT("sym branch: 0x%lx constraint: %s\n", addr, cond.to_string().c_str());
     // return;
     // collect additional input deps
     std::vector<dfsan_label> worklist;
@@ -1049,7 +798,6 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
     __z3_solver.set("timeout", 5000U);
     // 2. add constraints
     expr_set_t added;
-
     for (auto off : inputs) {
       // AOUT("adding offset 0x%lx\n", off);
       auto deps = get_branch_dep(off);
@@ -1062,113 +810,6 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
         }
       }
     }
-
-/* 
- TO DO: Change to have constraint set; not just one condition - go back to collect all the data dependencies from the current label and their constraints
- The defaut solving strategy should have this; not optimistic. See if evaluating after add_nested can help
-
- Also, make the loop bound variable symbolic when testing
-
- End goal to get formula (i.e., N = S * 4) from LLM based on constraints and x86 code
-
- Know variable location - is it a register or variable? If so, in which function? Which is is associated with? 
-
- In the future (not now), add the guest memory address to the label structure
-
- int array[1];
- int bound = 1; // symbolic, derived from syscall argument (this is simplified code)
- while (iterator < bound) {
-   array[iterator] = 0; // OOB write
-   iterator++;
- }
-
- 1) Feed KASAN report + binary (PC from KASAN report) + source to LLM, derive a formula/function where N = S_bound * 4;
- 2) Then query symbolic label of S_bound at the conditional jump (LLM needs to tell us the PC) / compare instruction -> S_bound = (S_arg1 + 2) * 3, S_arg1 < 100)
-  Final output: 
-  N = S_bound * 4, constraints (S_bound)
-  N = (S_art1 + 2) * 3 * 4, constraints (S_arg1)
-
- And then you can derive the relation between S_bound and N based on the constraints
- What would be nice to have, though it would take a while, is a mapping of the variable to the label
-*/
-
-/*
-if (print_debug) {
-  AOUT("\n=== CONSTRAINTS (Original) ===\n");
-  AOUT("%s\n", __z3_solver.to_smt2().c_str());
-  
-  // Check if solvable
-  if (__z3_solver.check() == z3::sat) {
-    z3::model m = __z3_solver.get_model();
-    
-    AOUT("\n=== SOLUTION (Human-Readable) ===\n");
-    for (unsigned i = 0; i < m.size(); i++) {
-      z3::func_decl v = m[i];
-      AOUT("  %s = %s\n", 
-           v.name().str().c_str(),
-           m.get_const_interp(v).to_string().c_str());
-    }
-    
-    // Evaluate each constraint with the solution
-    AOUT("\n=== CONSTRAINTS WITH VALUES ===\n");
-    z3::expr_vector assertions = __z3_solver.assertions();
-    for (unsigned i = 0; i < assertions.size(); i++) {
-      z3::expr evaluated = m.eval(assertions[i], true);
-      AOUT("  %s evaluates to %s\n",
-           assertions[i].to_string().c_str(),
-           evaluated.to_string().c_str());
-    }
-  }
-  
-  AOUT("====================================\n\n");
-}
-*/
-
-if (print_debug) {
-    AOUT("\n=== CONSTRAINTS (Original) ===\n");
-    AOUT("%s\n", __z3_solver.to_smt2().c_str());
-
-    z3::check_result checked_result = __z3_solver.check();
-    AOUT("\n=== SOLVER RESULT: %s ===\n",
-         checked_result == z3::sat ? "SAT" :
-         checked_result == z3::unsat ? "UNSAT" : "UNKNOWN");
-
-    if (checked_result == z3::sat) {
-        z3::model m = __z3_solver.get_model();
-
-        AOUT("\n=== SOLUTION (Human-Readable) ===\n");
-        // ...
-    for (unsigned i = 0; i < m.size(); i++) {
-      z3::func_decl v = m[i];
-      AOUT("  %s = %s\n",
-           v.name().str().c_str(),
-           m.get_const_interp(v).to_string().c_str());
-    }
-
-    AOUT("\n=== CONSTRAINTS WITH VALUES ===\n");
-    z3::expr_vector assertions = __z3_solver.assertions();
-    for (unsigned i = 0; i < assertions.size(); i++) {
-      z3::expr evaluated = m.eval(assertions[i], true);
-      AOUT("  %s evaluates to %s\n",
-           assertions[i].to_string().c_str(),
-           evaluated.to_string().c_str());
-        }
-    } else if (checked_result == z3::unsat) {
-        AOUT("\n=== PATH IS UNSATISFIABLE ===\n");
-        AOUT("This branch cannot be taken with the accumulated constraints.\n");
-
-        // Optionally: print unsat core
-        //if (print_debug > 1) {
-            z3::expr_vector core = __z3_solver.unsat_core();
-            AOUT("\n=== UNSAT CORE (%u constraints) ===\n", core.size());
-            for (unsigned i = 0; i < core.size(); i++) {
-                AOUT("[%u] %s\n", i, core[i].to_string().c_str());
-            }
-        //}
-    }
-
-    AOUT("====================================\n\n");
-}
     // fprintf(stderr, "%s\n", __z3_solver.to_smt2().c_str());
     // fprintf(stderr, "%s\n", cond.to_string().c_str());
     // return;
@@ -1220,8 +861,8 @@ static void __solve_last_cond(dfsan_label label, u8 r, std::unordered_set<dfsan_
     // std::unordered_set<dfsan_label> inputs;
     z3::expr cond = serialize(label, inputs).simplify();
 
-    AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-    AOUT("sym branch: 0x%lx constraint: %s\n", addr, cond.to_string().c_str());
+    // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+    // AOUT("sym branch: 0x%lx constraint: %s\n", addr, cond.to_string().c_str());
     // return;
     // collect additional input deps
     std::vector<dfsan_label> worklist;
@@ -1373,7 +1014,6 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
         // }
       }
     }
-
     assert(__z3_solver.check() == z3::sat);
 
     // first, check against fixed array bounds if available
@@ -1489,10 +1129,10 @@ int main(int argc, char* const argv[]) {
   }
 
   // prepare the env and fork
-  int length = snprintf(NULL, 0, "taint_file=\"%s\":shm_id=%d:pipe_fd=%d:debug=1",
+  int length = snprintf(NULL, 0, "taint_file=\"%s\":shm_id=%d:pipe_fd=%d:debug=0",
                         input, shmid, pipefds[1]);
   options = (char *)malloc(length + 1);
-  snprintf(options, length + 1, "taint_file=\"%s\":shm_id=%d:pipe_fd=%d:debug=1",
+  snprintf(options, length + 1, "taint_file=\"%s\":shm_id=%d:pipe_fd=%d:debug=0",
            input, shmid, pipefds[1]);
   
   int pid = fork();
@@ -1517,14 +1157,13 @@ int main(int argc, char* const argv[]) {
 
   // get bitmap file from env SYMCC_AFL_COVERAGE_MAP
   // so it's compatibale with symcc driver.
-
   const char* bitmap = std::getenv("SYMCC_AFL_COVERAGE_MAP");
-    if (!bitmap) {
-      fprintf(stderr, "WARNING: SYMCC_AFL_COVERAGE_MAP not set, coverage-guided solving disabled\n");
-      _trace = nullptr;  // Disable coverage-based branch filtering
-    } else {
-      _trace = new AflTraceMap(bitmap);
-    }
+  if (!bitmap) {
+    fprintf(stderr, "Failed to get bitmap file from env\n");
+    exit(1);
+  }
+  _trace = new AflTraceMap(bitmap);
+  // _trace(bitmap);
 
   pipeMsg msg;
   gep_msg gmsg;
@@ -1545,13 +1184,11 @@ int main(int argc, char* const argv[]) {
         // last_label = msg.label;
         // last_pc = msg.id;
         // fprintf(stderr, "sym branch: 0x%lx %s\n", msg.id, msg.result? "taken":"not taken");
-        if (_trace == nullptr || _trace->isInterestingBranch(msg.id, msg.result)) {
-        //if (_trace->isInterestingBranch(msg.id, msg.result)) {
+        if (_trace->isInterestingBranch(msg.id, msg.result)) {
           // branch_label.push_back({msg.id, msg.label});
           // branch_size++;
           // AOUT("interesting branch: 0x%lx, %s\n", msg.id, msg.result? "taken":"not taken");
-          
-__solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
+          __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
           
           // collect_input_deps(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
         

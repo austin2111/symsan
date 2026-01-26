@@ -18,6 +18,9 @@
 // Use libdft implemented by intel pin
 #define CLANG_PIN_TYPE 3
 
+// Added for static address test
+#define STATIC_TRIGGER_MSG_TYPE 4
+
 #define CUSTOM_FN_CTX "ANGORA_CUSTOM_FN_CONTEXT"
 #define GEN_ID_RANDOM_VAR "ANGORA_GEN_ID_RANDOM"
 #define OUTPUT_COND_LOC_VAR "ANGORA_OUTPUT_COND_LOC"

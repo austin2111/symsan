@@ -121,8 +121,8 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   }
 
   dfsan_label_info *info = get_label_info(label);
-  AOUT("%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%llu, op2:%llu)\n",
-       label, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
+  AOUT("%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%llu, op2:%llu, pc: 0x%llx)\n",
+       label, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i, info->pc);
 
   auto expr_itr = expr_cache.find(label);
   if (expr_itr != expr_cache.end()) {
@@ -349,6 +349,7 @@ static bool __solve_expr(z3::expr &e) {
       generate_input(m);
       ret = true;
     } else {
+      AOUT("Rejected case!\n");
     #if OPTIMISTIC
       z3::model m = opt_solver.get_model();
       generate_input(m);
@@ -460,10 +461,10 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
     return;
   }
 
-  AOUT("solving cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
+  AOUT("z3 solving cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
        op1, op2, size, predicate, c1, c2, cid, addr);
 
-  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
+  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2, cid);
 
   z3::expr bv_c1 = __z3_context.bv_val((uint64_t)c1, size);
   z3::expr bv_c2 = __z3_context.bv_val((uint64_t)c2, size);
@@ -683,7 +684,8 @@ static void __add_constraints(dfsan_label label) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size) {
-  dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, size, 0, offset);
+  dfsan_label_info *info = get_label_info(offset_label);
+  dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, size, 0, offset, info->pc);
   __add_constraints(sc);
 }
 

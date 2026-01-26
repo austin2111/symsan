@@ -23,6 +23,25 @@ if (NOT TARGET LLVMPassConfig)
     )
 endif()
 
+option(SYMSAN_DEBUG  "Enable dfsan debug flag" OFF)
+set(DFSAN_FLAGS_INC "${CMAKE_CURRENT_SOURCE_DIR}/runtime/dfsan/dfsan_flags.inc")
+
+file(READ "${DFSAN_FLAGS_INC}" DFSAN_FLAGS_CONTENTS)
+
+if(SYMSAN_DEBUG)
+  set(DEBUG_VALUE "true")
+else()
+  set(DEBUG_VALUE "false")
+endif()
+
+string(REGEX REPLACE
+  "DFSAN_FLAG\\(bool, *debug, *(true|false),"
+  "DFSAN_FLAG(bool, debug, ${DEBUG_VALUE},"
+  DFSAN_FLAGS_CONTENTS
+  "${DFSAN_FLAGS_CONTENTS}")
+
+file(WRITE "${DFSAN_FLAGS_INC}" "${DFSAN_FLAGS_CONTENTS}")
+
 include_directories(${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 

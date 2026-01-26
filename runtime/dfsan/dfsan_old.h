@@ -48,7 +48,6 @@ struct dfsan_label_info {
   u16 op;
   u16 size; // FIXME: this limit the size of the operand to 65535 bits or bytes (in case of memcmp)
   u32 hash;
-  u64 pc;
 } __attribute__((aligned (8), packed));
 
 #ifndef PATH_MAX
@@ -72,11 +71,11 @@ struct taint_file {
 
 extern "C" {
 void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size);
-void dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc);
+void dfsan_set_label(dfsan_label label, void *addr, uptr size);
 dfsan_label dfsan_read_label(const void *addr, uptr size);
-void dfsan_store_label(dfsan_label l1, void *addr, uptr size, u64 pc);
+void dfsan_store_label(dfsan_label l1, void *addr, uptr size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
-                        u64 op1, u64 op2, u64 pc);
+                        u64 op1, u64 op2);
 dfsan_label dfsan_create_label(off_t offset);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
@@ -98,8 +97,8 @@ int is_utmp_taint(void);
 }  // extern "C"
 
 template <typename T>
-void dfsan_set_label(dfsan_label label, T &data, u64 pc) {  // NOLINT
-  dfsan_set_label(label, (void *)&data, sizeof(T), pc);
+void dfsan_set_label(dfsan_label label, T &data) {  // NOLINT
+  dfsan_set_label(label, (void *)&data, sizeof(T));
 }
 
 namespace __dfsan {
@@ -201,7 +200,6 @@ enum pipe_msg_type {
   memcmp_type = 2,
   fsize_type = 3,
   debug_type = 4,
-  static_trigger_type = 5,
 };
 
 #define F_ADD_CONS  0x1
