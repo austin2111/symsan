@@ -25,6 +25,9 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <regex>
+
+#include "pc_tracker.h" // Defined for JSON PC constraint logger
+
 using namespace __dfsan;
 using namespace qsym;
 #define OPTIMISTIC 1
@@ -38,6 +41,13 @@ bool print_debug = true;
 static dfsan_label_info *__dfsan_label_info;
 static char *input_buf;
 static size_t input_size;
+
+/* Definitions for JSON PC constraint logger */
+
+// Global PC tracker
+static PCTracker* g_pc_tracker = nullptr;
+
+/* End definitions for JSON PC constraint logger */
 
 dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
@@ -67,7 +77,7 @@ static bool should_filter_by_pc(u64 pc) {
         return true;
 
     // check_memory_region/memory_is_nonzero
-    // WARNING: This shoulld probably be commented out!
+    // WARNING: This should probably be commented out!
     if (pc >= 0xffffffff81964130 && pc <= 0xffffffff819642e4)
         return true;
 
@@ -89,6 +99,7 @@ static bool should_filter_by_pc(u64 pc) {
 
     // sysvec_apic_timer_interrupt
     if (pc >= 0xffffffff84424560 && pc <= 0xffffffff8442461b)
+        return true;
 
     return false;
 }
@@ -1027,6 +1038,7 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
         printf("ALLOCATOR_DEBUG: This looks like an allocator constraint! Returning...\n");
         return;
     }
+
     //printf("ALLOCATOR_DEBUG: is_allocator_constraint returned %d!\n", is_allocator_constraint(cond));
     // return;
     // collect additional input deps
@@ -1063,92 +1075,66 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
       }
     }
 
-/* 
- TO DO: Change to have constraint set; not just one condition - go back to collect all the data dependencies from the current label and their constraints
- The defaut solving strategy should have this; not optimistic. See if evaluating after add_nested can help
+    z3::check_result checked_result = __z3_solver.check();
 
- Also, make the loop bound variable symbolic when testing
+    // ==== PC TRACKING WITH MODEL ====
+    if (g_pc_tracker && g_pc_tracker->is_tracked(addr)) {
+        std::ofstream* log = g_pc_tracker->get_log(addr);
 
- End goal to get formula (i.e., N = S * 4) from LLM based on constraints and x86 code
+        *log << "--- Constraint at PC 0x" << std::hex << addr << " ---\n";
+        *log << "Timestamp: " << std::dec << time(NULL) << "\n";
+        *log << "Branch taken: " << (r ? "true" : "false") << "\n";
+        *log << "Constraint: " << cond.to_string() << "\n";
 
- Know variable location - is it a register or variable? If so, in which function? Which is is associated with? 
+        if (checked_result == z3::sat) {
+            z3::model mod = __z3_solver.get_model();
+            
+            *log << "\n=== CONSTRAINTS WITH VALUES ===\n";
+            z3::expr_vector assertions = __z3_solver.assertions();
+            for (unsigned i = 0; i < assertions.size(); i++) {
+                try {
+                    z3::expr evaluated = mod.eval(assertions[i], true);
+                    *log << "  " << assertions[i].to_string()
+                         << " evaluates to " << evaluated.to_string() << "\n";
+                } catch (z3::exception &e) {
+                    *log << "  [eval error: " << e.msg() << "]\n";
+                }
+            }
+        } else if (checked_result == z3::unsat) {
+            *log << "\n=== PATH IS UNSATISFIABLE ===\n";
+        }
 
- In the future (not now), add the guest memory address to the label structure
+        *log << "\nCurrent solver state (SMT2):\n";
+        *log << __z3_solver.to_smt2() << "\n";
 
- int array[1];
- int bound = 1; // symbolic, derived from syscall argument (this is simplified code)
- while (iterator < bound) {
-   array[iterator] = 0; // OOB write
-   iterator++;
- }
-
- 1) Feed KASAN report + binary (PC from KASAN report) + source to LLM, derive a formula/function where N = S_bound * 4;
- 2) Then query symbolic label of S_bound at the conditional jump (LLM needs to tell us the PC) / compare instruction -> S_bound = (S_arg1 + 2) * 3, S_arg1 < 100)
-  Final output: 
-  N = S_bound * 4, constraints (S_bound)
-  N = (S_art1 + 2) * 3 * 4, constraints (S_arg1)
-
- And then you can derive the relation between S_bound and N based on the constraints
- What would be nice to have, though it would take a while, is a mapping of the variable to the label
-*/
-
-/*
-if (print_debug) {
-  AOUT("\n=== CONSTRAINTS (Original) ===\n");
-  AOUT("%s\n", __z3_solver.to_smt2().c_str());
-  
-  // Check if solvable
-  if (__z3_solver.check() == z3::sat) {
-    z3::model m = __z3_solver.get_model();
-    
-    AOUT("\n=== SOLUTION (Human-Readable) ===\n");
-    for (unsigned i = 0; i < m.size(); i++) {
-      z3::func_decl v = m[i];
-      AOUT("  %s = %s\n", 
-           v.name().str().c_str(),
-           m.get_const_interp(v).to_string().c_str());
+        log->flush();
     }
-    
-    // Evaluate each constraint with the solution
-    AOUT("\n=== CONSTRAINTS WITH VALUES ===\n");
-    z3::expr_vector assertions = __z3_solver.assertions();
-    for (unsigned i = 0; i < assertions.size(); i++) {
-      z3::expr evaluated = m.eval(assertions[i], true);
-      AOUT("  %s evaluates to %s\n",
-           assertions[i].to_string().c_str(),
-           evaluated.to_string().c_str());
-    }
-  }
-  
-  AOUT("====================================\n\n");
-}
-*/
 
 if (print_debug) {
     AOUT("\n=== CONSTRAINTS (Original) ===\n");
     AOUT("%s\n", __z3_solver.to_smt2().c_str());
 
-    z3::check_result checked_result = __z3_solver.check();
+    //z3::check_result checked_result = __z3_solver.check();
     AOUT("\n=== SOLVER RESULT: %s ===\n",
          checked_result == z3::sat ? "SAT" :
          checked_result == z3::unsat ? "UNSAT" : "UNKNOWN");
 
     if (checked_result == z3::sat) {
-        z3::model m = __z3_solver.get_model();
+        z3::model mod = __z3_solver.get_model();
 
         AOUT("\n=== SOLUTION (Human-Readable) ===\n");
         // ...
-    for (unsigned i = 0; i < m.size(); i++) {
-      z3::func_decl v = m[i];
+    for (unsigned i = 0; i < mod.size(); i++) {
+      z3::func_decl v = mod[i];
       AOUT("  %s = %s\n",
            v.name().str().c_str(),
-           m.get_const_interp(v).to_string().c_str());
+           mod.get_const_interp(v).to_string().c_str());
     }
 
     AOUT("\n=== CONSTRAINTS WITH VALUES ===\n");
     z3::expr_vector assertions = __z3_solver.assertions();
     for (unsigned i = 0; i < assertions.size(); i++) {
-      z3::expr evaluated = m.eval(assertions[i], true);
+      z3::expr evaluated = mod.eval(assertions[i], true);
       AOUT("  %s evaluates to %s\n",
            assertions[i].to_string().c_str(),
            evaluated.to_string().c_str());
@@ -1448,6 +1434,9 @@ int main(int argc, char* const argv[]) {
 
   // load input file from symcc env.
   char *input = getenv("SYMCC_INPUT_FILE");
+
+  const char* pc_config = getenv("SYMSAN_PC_CONFIG");
+
   if (input == NULL) {
       fprintf(stderr, "ERROR: Cannot read SYMCC_INPUT_FILE environment variable! Exiting...\n");
       exit(1);
@@ -1466,6 +1455,32 @@ int main(int argc, char* const argv[]) {
     fprintf(stderr, "Failed to map input file: %s\n", strerror(errno));
     exit(1);
   }
+  }
+
+  if (pc_config != NULL) {
+    fprintf(stderr, "\n=== PC Tracking Configuration ===\n");
+    g_pc_tracker = new PCTracker();
+    
+    if (g_pc_tracker->load_config(pc_config)) {
+        // Initialize log files
+        const char* constraint_dir = getenv("SYMSAN_CONSTRAINT_DIR");
+        if (constraint_dir == NULL) {
+            constraint_dir = "constraints";  // Default
+        }
+        
+        if (g_pc_tracker->init_log_files(constraint_dir)) {
+            fprintf(stderr, "✓ PC tracking enabled\n");
+        } else {
+            fprintf(stderr, "WARNING: Failed to initialize constraint logs\n");
+            delete g_pc_tracker;
+            g_pc_tracker = nullptr;
+        }
+    } else {
+        fprintf(stderr, "WARNING: PC tracking disabled (no valid config)\n");
+        delete g_pc_tracker;
+        g_pc_tracker = nullptr;
+    }
+    fprintf(stderr, "=================================\n\n");
   }
 
   // setup shmem and pipe
