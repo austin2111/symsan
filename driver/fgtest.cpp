@@ -89,7 +89,8 @@ static bool should_filter_by_pc(u64 pc) {
 
     // sysvec_apic_timer_interrupt
     if (pc >= 0xffffffff84424560 && pc <= 0xffffffff8442461b)
-
+        return true;
+  
     return false;
 }
 
