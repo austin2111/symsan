@@ -101,6 +101,10 @@ static bool should_filter_by_pc(u64 pc) {
     if (pc >= 0xffffffff84424560 && pc <= 0xffffffff8442461b)
         return true;
 
+    // irqtime_account_process_tick
+    if (pc >= 0xffffffff81439280 && pc <= 0xffffffff814396ee)
+        return true;
+  
     return false;
 }
 
