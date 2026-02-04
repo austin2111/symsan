@@ -1119,7 +1119,7 @@ __dfsan_read(int fd, void *buf, size_t count, size_t *isSymbolicPage) {
       //   dfsan_set_label(-1, (char *)buf + i, 1);
       // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
     } else {
-      if (is_stdin_taint()) {
+      if (is_stdin_taint() && fd == 0) { // BUGFIX: Make sure we're actually reading from stdin and not some random pipe
         for(ssize_t i = 0; i < ret; i++) {
           label = get_label_for(fd, i);
           //dfsan_set_label(get_label_for(fd, i), (char *)buf + i, 1);
