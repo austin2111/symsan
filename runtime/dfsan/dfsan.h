@@ -80,6 +80,7 @@ dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
 dfsan_label dfsan_create_label(off_t offset);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
+uptr dfsan_get_label_count(void); // Added to support external queries for number of labels
 
 // taint source
 void taint_set_file(const char *filename, int fd);

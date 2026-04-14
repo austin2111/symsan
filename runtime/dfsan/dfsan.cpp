@@ -47,6 +47,9 @@
 
 using namespace __dfsan;
 
+extern "C" void telemetry_send(const char *json);
+extern "C" char telemetry_enabled;
+
 // ===== ADD THESE LINES =====
 //#define STATIC_TRIGGER_ADDR 0x100000ULL
 #define STATIC_TRIGGER_ADDR 0x500000ULL
@@ -414,6 +417,46 @@ __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
   const char* op_name = get_op_name(op & 0xff, (op >> 8));
   //AOUT("%u = (%u, %u, %u, %u, %llu, %llu)\n", label, l1, l2, op, size, op1, op2);
   AOUT("%u = (%u, %u, %s, %u, %llu, %llu, 0x%llx)\n", label, l1, l2, op_name, size, op1, op2, pc);
+  if (telemetry_enabled) {
+      char jsonbuffer[956];
+      char label_summary[256];
+      u16 op_base = op & 0xff;  // strip predicate from upper byte
+      if (op_base == Extract) {
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = Extract bits [%llu:%llu] of label %u at PC 0x%llx",
+            label, op1, op2, l1, pc);
+    } else if (op_base == Concat) {
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = Concat label %u (val=%llu) : label %u (val=%llu, size=%u) at PC 0x%llx",
+            label, l1, op1, l2, op2, size, pc);
+    } else if (l2 == 0) {
+        // Unary operation
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = %s label %u (val=%llu, size=%u) at PC 0x%llx",
+            label, op_name, l1, op1, size, pc);
+    } else {
+        // Binary operation
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = label %u (val=%llu) %s label %u (val=%llu, size=%u) at PC 0x%llx",
+            label, l1, op1, op_name, l2, op2, size, pc);
+    }
+    internal_snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+          "{"
+          "\"source\": \"dfsan\","
+          "\"trigger\": \"label_creation\","
+          "\"label_summary\": \"%s\","
+          "\"label\": %u,"
+          "\"l1\": %u,"
+          "\"l2\": %u,"
+          "\"op\": \"%s\","
+          "\"size\": %u,"
+          "\"op1\": %llu,"
+          "\"op2\": %llu,"
+          "\"pc\": \"0x%llx\""
+          "}",
+          label_summary, label, l1, l2, op_name, size, op1, op2, pc);
+      telemetry_send(jsonbuffer);
+  }
   internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
   __union_table.insert(&__dfsan_label_info[label], label);
   return label;
@@ -733,7 +776,20 @@ void __dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc) {
     // the amount of real memory used by large programs.
     if (label == *labelp)
       continue;
-
+    if (telemetry_enabled) {
+      char jsonbuffer[500];
+      snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+          "{"
+          "\"source\": \"dfsan\","
+          "\"trigger\": \"taint_introduction\","
+          "\"address\": \"0x%lx\","
+          "\"label\": %u,"
+          "\"label_size\": %d,"
+          "\"pc\": \"0x%llx\""
+          "}",
+          (unsigned long)addr, label, get_label_info(label)->size, pc);
+      telemetry_send(jsonbuffer);
+    }
     AOUT("set label %p = %u, label size %d shadow addr: %p, pc 0x%llx\n", addr, label, get_label_info(label)->size, shadow_for(addr), pc);
     *labelp = label;
   }
@@ -1292,6 +1348,46 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u64 result, u32 pr
     return 0;
 
   void *addr = __builtin_return_address(0);
+
+  if (telemetry_enabled) {
+      // Build natural language summary first for LLM/JSON transmission
+      char summary[256];
+      const char * predicate_name = get_predicate_name(predicate); // Since we're using this twice, should we get this once unconditionally?
+      if (op1 != 0 && op2 == 0) {
+          snprintf(summary, sizeof(summary) - 1,
+              "%llu (label %u) %s %llu (constant) at PC 0x%llx, result: %s",
+              c1, op1, predicate_name, c2, cid, result ? "taken" : "not taken");
+      } else if (op1 == 0 && op2 != 0) {
+          snprintf(summary, sizeof(summary) - 1,
+              "%llu (constant) %s %llu (label %u) at PC 0x%llx, result: %s",
+              c1, predicate_name, c2, op2, cid, result ? "taken" : "not taken");
+      } else {
+          snprintf(summary, sizeof(summary) - 1,
+              "%llu (label %u) %s %llu (label %u) at PC 0x%llx, result: %s",
+              c1, op1, predicate_name, c2, op2, cid, result ? "taken" : "not taken");
+      }
+      char jsonbuffer[1280];
+      snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+          "{"
+          "\"source\": \"dfsan\","
+          "\"trigger\": \"branch_eval\","
+          "\"summary\": \"%s\","
+          "\"pc\": \"0x%llx\","
+          "\"predicate\": \"%s\","
+          "\"op1_symbolic\": %s,"
+          "\"op1_label\": %u,"
+          "\"op1_val\": %llu,"
+          "\"op2_symbolic\": %s,"
+          "\"op2_label\": %u,"
+          "\"op2_val\": %llu,"
+          "\"result\": %d"
+          "}",
+          summary, cid, predicate_name,
+          (op1 != 0) ? "true" : "false", op1, c1,
+          (op2 != 0) ? "true" : "false", op2, c2,
+          (int)result);
+      telemetry_send(jsonbuffer);
+  }
 
     // Enhanced logging with concrete values via Claude. Erase/etc as necessary
     if (print_debug) {

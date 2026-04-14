@@ -28,6 +28,16 @@
 
 #include "pc_tracker.h" // Defined for JSON PC constraint logger
 
+// Defines for MCP integration
+#include <mutex>
+#include <thread>
+#include <sstream>
+#include <iomanip>
+#include <array>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 using namespace __dfsan;
 using namespace qsym;
 #define OPTIMISTIC 1
@@ -35,12 +45,137 @@ using namespace qsym;
 #undef AOUT
 # define AOUT(...)                                      \
   do {                                                  \
-    fprintf(stderr, __VA_ARGS__);                                \
+    fprintf(debug_out, __VA_ARGS__);                                \
   } while(false)
 bool print_debug = true;
 static dfsan_label_info *__dfsan_label_info;
 static char *input_buf;
 static size_t input_size;
+
+static FILE *debug_out = nullptr;
+
+// Support functions/structures for MCP integration follow
+
+static std::unordered_map<uint64_t, unsigned char> pc_verdict;
+static std::mutex pc_verdict_mutex;
+static uint32_t g_max_label_seen = 0;
+
+extern std::atomic<uint32_t> __dfsan_last_label; // For label count retrieval
+// Do we need these #defines? These should be ...optional
+
+#define VERDICT_NONE 0
+#define VERDICT_BLACKLIST 1
+#define VERDICT_PENDING 2
+
+// Recent constraint circular buffer
+//#define RECENT_WINDOW 10;
+static const unsigned char RECENT_WINDOW = 10; // Is that enough types in a single definition?
+static std::array<std::pair<uint64_t, std::string>, RECENT_WINDOW> recent_constraints;
+static size_t recent_head  = 0;
+static size_t recent_count = 0;
+
+struct TriggerPacket {
+    uint64_t    pc;
+    uint32_t    label;
+    uint32_t    label_count;
+    std::vector<std::pair<uint64_t, std::string>> recent_constraints;
+    std::string smt2;           // full SMT2, may be large
+    std::string smt2_truncated; // last N assertions only
+};
+
+static std::string json_escape(const std::string &s) {
+    std::string out;
+    for (char c : s) {
+        if      (c == '"')  out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else                out += c;
+    }
+    return out;
+}
+
+static std::string serialize_trigger_packet(const TriggerPacket &packet) {
+    std::ostringstream j;
+
+    j << "{\n";
+    j << "  \"trigger\": \"unsat_constraint\",\n";
+    j << "  \"pc\": \"0x" << std::hex << packet.pc << "\",\n";
+    j << "  \"label\": " << std::dec << packet.label << ",\n";
+    j << "  \"label_count\": " << packet.label_count << ",\n";
+
+    // Recent constraints array
+    j << "  \"recent_constraints\": [\n";
+    for (size_t i = 0; i < packet.recent_constraints.size(); i++) {
+        const auto &entry = packet.recent_constraints[i];
+        j << "    {\n";
+        j << "      \"pc\": \"0x" << std::hex << entry.first << "\",\n";
+        j << "      \"constraint\": \""
+          << json_escape(entry.second) << "\"\n";
+        j << "    }";
+        if (i + 1 < packet.recent_constraints.size()) j << ",";
+        j << "\n";
+    }
+    j << "  ],\n";
+
+    j << "  \"smt2\": \"" << json_escape(packet.smt2) << "\",\n";
+    j << "  \"smt2_truncated\": \""
+      << json_escape(packet.smt2_truncated) << "\"\n";
+    j << "}\n";
+
+    return j.str();
+}
+
+void send_task(int ip_addr, unsigned short port, std::string message) {
+    std::vector<char> buf(message.size() + 4);
+    uint32_t net_len = htonl(message.size());
+    memcpy(buf.data(), &net_len, 4);
+    memcpy(buf.data() + 4, message.c_str(), message.size());
+
+    int socket_desc = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = ip_addr;
+    connect(socket_desc, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    send(socket_desc, buf.data(), buf.size(), 0);
+    close(socket_desc);
+}
+
+std::string truncate_smt2(const std::string &smt2, size_t keep_last_n) {
+    // Find where assertions start
+    size_t first_assert = smt2.find("(assert");
+    if (first_assert == std::string::npos)
+        return smt2;  // no assertions, return as-is
+
+    std::string header = smt2.substr(0, first_assert);
+
+    // Collect positions of all assertions
+    std::vector<size_t> assert_positions;
+    size_t pos = first_assert;
+    while (pos != std::string::npos) {
+        assert_positions.push_back(pos);
+        pos = smt2.find("(assert", pos + 1);
+    }
+
+    // If we have fewer than keep_last_n, return full string
+    if (assert_positions.size() <= keep_last_n)
+        return smt2;
+
+    // Take from the Nth-from-last assertion onward
+    size_t start = assert_positions[assert_positions.size() - keep_last_n];
+    return header + smt2.substr(start);
+}
+
+void apply_verdict(uint64_t pc, unsigned char flags) {
+    std::lock_guard<std::mutex> lock(pc_verdict_mutex);
+    if (flags == VERDICT_NONE) {
+        pc_verdict.erase(pc);
+    } else {
+        pc_verdict[pc] = flags;
+    }
+}
 
 /* Definitions for JSON PC constraint logger */
 
@@ -104,7 +239,7 @@ static bool should_filter_by_pc(u64 pc) {
     // irqtime_account_process_tick
     if (pc >= 0xffffffff81439280 && pc <= 0xffffffff814396ee)
         return true;
-  
+
     return false;
 }
 
@@ -198,6 +333,12 @@ bool is_allocator_constraint(z3::expr e) {
 }
 
 // End selective constraint dropping helper code
+
+/* Unordered set for internal map */
+// This is necessary for applications where AFL trace maps are inappropriate,
+// such as incorporating the solver with a kernel.
+
+static std::unordered_set<uint64_t> solved_branches;
 
 // for output
 static const char* __output_dir = ".";
@@ -1010,14 +1151,33 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
       printf("DEBUG: Label is 0! Let's not solve for this.\n");
       return;
   }
+  if (label > g_max_label_seen) g_max_label_seen = label;
+  std::lock_guard<std::mutex> lock(pc_verdict_mutex);
+  if (pc_verdict.count(addr)) {
+    // These've been commented out for future expansion; for the moment, if there's a map entry, we skip.
+    /*
+    unsigned char verdict = 0;
+    verdict = pc_verdict[addr];
+    if ((verdict & 1) || (verdict & 2)) { // If verdict is blacklisted or pending
+    */
+      if (print_debug) { 
+        AOUT("[FILTERED PC] Skipping function at 0x%llx\n", addr);
+      }
+    return;
+    /*
+    }
+    */
+  }
 
   // Filter by PC FIRST (before any expensive operations)
+  /*
   if (should_filter_by_pc(addr)) {
       if (print_debug) {
           AOUT("[FILTERED PC] Skipping noisy function at 0x%llx\n", addr);
       }
       return;
   }
+  */
 
   z3::expr result = __z3_context.bool_val(r != 0);
 
@@ -1027,6 +1187,7 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
     z3::expr cond = serialize(label, inputs).simplify();
 
     // ===== NEW: Filter concrete/trivial branches =====
+    /*
     if (cond.is_true() || cond.is_false()) {
         if (print_debug) {
             AOUT("[CONCRETE] Branch at PC 0x%llx simplified to: %s\n",
@@ -1034,17 +1195,77 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
         }
         return;  // Don't add constraint
     }
+    */
+    if (cond.is_true()) {
+        if (print_debug) {
+            AOUT("[CONCRETE] Branch at PC 0x%llx always true, skipping\n", addr);
+        }
+        return;
+    }
+
+    if (cond.is_false()) {
+        if (print_debug) {
+            AOUT("[CONCRETE] Branch at PC 0x%llx always false (contradiction)\n", addr);
+        }
+        // Fire a telemetry event — this is a genuine unsatisfiable constraint
+            char jsonbuffer[512];
+            snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+                "{"
+                "\"source\": \"fgtest\","
+                "\"trigger\": \"unsat_constraint\","
+                "\"pc\": \"0x%llx\","
+                "\"reason\": \"expression_simplified_to_false\","
+                "\"constraint\": \"%s\""
+                "}",
+                addr, "false");
+            //telemetry_send(jsonbuffer);
+            //send_task(inet_addr("127.0.0.1"), 23100, std::string(jsonbuffer));
+            std::thread t1(send_task, inet_addr("127.0.0.1"), 23100, std::string(jsonbuffer));
+            t1.detach();
+        return;
+    }
     // ================================================
 
     //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
     AOUT("sym branch: 0x%llx constraint: %s, add_nested: %d\n", addr, cond.to_string().c_str(), add_nested);
     if(is_allocator_constraint(cond)) {
         printf("ALLOCATOR_DEBUG: This looks like an allocator constraint! Returning...\n");
+
+        std::string raw_constraint = cond.to_string();
+        std::string escaped_constraint;
+        escaped_constraint.reserve(raw_constraint.size());
+        for (char c : raw_constraint) {
+            switch (c) {
+                case '"':  escaped_constraint += "\\\""; break;
+                case '\\': escaped_constraint += "\\\\"; break;
+                case '\n': escaped_constraint += "\\n";  break;
+                case '\r': escaped_constraint += "\\r";  break;
+                case '\t': escaped_constraint += "\\t";  break;
+                default:   escaped_constraint += c;      break;
+            }
+        }
+
+        char jsonbuffer[768];
+        snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+            "{"
+            "\"source\": \"fgtest\","
+            "\"trigger\": \"filtered_constraint\","
+            "\"pc\": \"0x%llx\","
+            "\"reason\": \"allocator_heuristic\","
+            "\"constraint\": \"%s\""
+            "}",
+            //addr, cond.to_string().c_str());
+            addr, escaped_constraint.c_str());
+        std::thread t1(send_task, inet_addr("127.0.0.1"), 23100,
+                       std::string(jsonbuffer));
+        t1.detach();
         return;
     }
 
-    //printf("ALLOCATOR_DEBUG: is_allocator_constraint returned %d!\n", is_allocator_constraint(cond));
-    // return;
+    recent_constraints[recent_head] = {addr, cond.to_string()};
+    recent_head = (recent_head + 1) % RECENT_WINDOW;
+    if (recent_count < RECENT_WINDOW) recent_count++;
+
     // collect additional input deps
     std::vector<dfsan_label> worklist;
     worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
@@ -1080,6 +1301,35 @@ static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
     }
 
     z3::check_result checked_result = __z3_solver.check();
+
+    if (checked_result == z3::unsat) {
+        if (!pc_verdict.count(addr)) {
+            TriggerPacket unsat_packet;
+            unsat_packet.pc          = addr;
+            unsat_packet.label       = label;
+            //unsat_packet.label_count = (uint32_t)dfsan_get_label_count();
+            unsat_packet.label_count = g_max_label_seen;
+            unsat_packet.smt2        = __z3_solver.to_smt2();
+            unsat_packet.smt2_truncated = truncate_smt2(unsat_packet.smt2, 15);
+
+            for (size_t i = 0; i < recent_count; i++) {
+                size_t idx = (recent_head - recent_count + i + RECENT_WINDOW) % RECENT_WINDOW;
+                unsat_packet.recent_constraints.push_back(recent_constraints[idx]);
+            }
+
+            std::string json_serialized = serialize_trigger_packet(unsat_packet);
+
+            // Anonymously scoped lock 
+            {
+                std::lock_guard<std::mutex> lock(pc_verdict_mutex);
+                pc_verdict[addr] = VERDICT_PENDING;
+            }
+
+            std::string payload = json_serialized;
+            std::thread t1(send_task, inet_addr("127.0.0.1"), 23100, payload);
+            t1.detach();
+        }
+    }
 
     // ==== PC TRACKING WITH MODEL ====
     if (g_pc_tracker && g_pc_tracker->is_tracked(addr)) {
@@ -1435,7 +1685,16 @@ int main(int argc, char* const argv[]) {
   //   size_t n = end == NULL? strlen(output) : (size_t)(end - output);
   //   __output_dir = strndup(output, n);
   // }
-
+    const char *debug_file = getenv("SYMFIT_DEBUG_OUTPUT");
+    if (debug_file) {
+        debug_out = fopen(debug_file, "w");
+        if (!debug_out) {
+            fprintf(stderr, "Failed to open debug output file: %s\n", debug_file);
+            debug_out = stderr;
+        }
+    } else {
+        debug_out = stderr;
+    }
   // load input file from symcc env.
   char *input = getenv("SYMCC_INPUT_FILE");
 
@@ -1564,13 +1823,37 @@ int main(int argc, char* const argv[]) {
         // last_label = msg.label;
         // last_pc = msg.id;
         // fprintf(stderr, "sym branch: 0x%lx %s\n", msg.id, msg.result? "taken":"not taken");
-        if (_trace == nullptr || _trace->isInterestingBranch(msg.id, msg.result)) {
+        if (_trace == nullptr || _trace->isInterestingBranch(msg.id, msg.result)) __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
+        // TO DO: Uncomment the C-style comments for the uninteresting branch filtering
+
+        if (_trace == nullptr) {
+            if (solved_branches.insert(msg.id).second) { // This should return true only if it's a new branch
+                __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
+            }
+            else {
+                if (print_debug) {
+                    printf("DEBUG: Not solving for uninteresting branch 0x%lx\n", msg.id);
+                    char jsonbuffer[256];
+                    snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+                        "{"
+                        "\"source\": \"fgtest\","
+                        "\"trigger\": \"duplicate_branch\","
+                        "\"pc\": \"0x%lx\""
+                        "}",
+                        msg.id);
+                    std::thread t1(send_task, inet_addr("127.0.0.1"), 23100,
+                                   std::string(jsonbuffer));
+                    t1.detach();
+                }
+            }
+        }
+        else if (_trace->isInterestingBranch(msg.id, msg.result)) {
         //if (_trace->isInterestingBranch(msg.id, msg.result)) {
           // branch_label.push_back({msg.id, msg.label});
           // branch_size++;
           // AOUT("interesting branch: 0x%lx, %s\n", msg.id, msg.result? "taken":"not taken");
           
-__solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
+            __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
           
           // collect_input_deps(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
         
